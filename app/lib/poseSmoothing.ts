@@ -12,7 +12,7 @@ export type PoseLandmark = {
   visibility?: number;
 };
 
-const DEFAULT_VISIBILITY_MIN = 0.5;
+const DEFAULT_VISIBILITY_MIN = 0.25;
 
 export function landmarkVisibility(lm: PoseLandmark | undefined): number {
   return lm?.visibility ?? 1;
@@ -26,27 +26,32 @@ export function calculateAngle(a: PoseLandmark, b: PoseLandmark, c: PoseLandmark
 }
 
 /**
- * Multi-landmark coordinate low-pass filter with velocity-adaptive smoothing.
- * Completely eliminates camera frame jitter and skeleton trembling while
- * instantly tracking intentional patient movements.
+ * Velocity-adaptive multi-landmark coordinate filter with dropout hold.
+ * Eliminates camera frame jitter, sensor noise, and skeleton trembling
+ * while tracking intentional physical therapy movements with zero perceived lag.
  */
 export class LandmarkSmoother {
   private smoothedLandmarks: PoseLandmark[] = [];
+  private missedFrames: number[] = [];
 
   constructor(
-    private readonly baseAlpha: number = 0.35,
-    private readonly noiseDeadband: number = 0.002, // ~2px normalized threshold
+    private readonly baseAlpha: number = 0.25,
+    private readonly noiseDeadband: number = 0.005, // ~5px normalized threshold
   ) {}
 
   reset() {
     this.smoothedLandmarks = [];
+    this.missedFrames = [];
   }
 
   update(landmarks: PoseLandmark[]): PoseLandmark[] {
-    if (!landmarks || landmarks.length === 0) return landmarks;
+    if (!landmarks || landmarks.length === 0) {
+      return this.smoothedLandmarks;
+    }
 
     if (this.smoothedLandmarks.length !== landmarks.length) {
       this.smoothedLandmarks = landmarks.map((lm) => ({ ...lm }));
+      this.missedFrames = new Array(landmarks.length).fill(0);
       return this.smoothedLandmarks;
     }
 
@@ -56,7 +61,20 @@ export class LandmarkSmoother {
       const raw = landmarks[i];
       const prev = this.smoothedLandmarks[i];
 
-      if (!raw || !prev) {
+      // If landmark is missing or low visibility, hold last known position for up to 6 frames
+      if (!raw || (raw.visibility !== undefined && raw.visibility < 0.2)) {
+        if (prev && this.missedFrames[i] < 6) {
+          this.missedFrames[i] += 1;
+          smoothed[i] = prev;
+          continue;
+        }
+        smoothed[i] = raw;
+        continue;
+      }
+
+      this.missedFrames[i] = 0;
+
+      if (!prev) {
         smoothed[i] = raw;
         continue;
       }
@@ -65,17 +83,17 @@ export class LandmarkSmoother {
       const dy = raw.y - prev.y;
       const dist = Math.sqrt(dx * dx + dy * dy);
 
-      // Deadband: If landmark barely moved (sensor noise jitter), freeze or heavily damp
+      // Deadband: Sensor micro-jitter - heavily damp to keep skeleton rock-still
       if (dist < this.noiseDeadband) {
         smoothed[i] = {
-          x: prev.x * 0.9 + raw.x * 0.1,
-          y: prev.y * 0.9 + raw.y * 0.1,
-          z: raw.z !== undefined && prev.z !== undefined ? prev.z * 0.9 + raw.z * 0.1 : raw.z,
+          x: prev.x * 0.95 + raw.x * 0.05,
+          y: prev.y * 0.95 + raw.y * 0.05,
+          z: raw.z !== undefined && prev.z !== undefined ? prev.z * 0.95 + raw.z * 0.05 : raw.z,
           visibility: raw.visibility,
         };
       } else {
-        // Dynamic responsiveness: when moving deliberately, increase alpha for 0-lag tracking
-        const adaptiveAlpha = Math.min(0.75, Math.max(this.baseAlpha, this.baseAlpha + dist * 6));
+        // Dynamic adaptive alpha: scale smoothly with intentional speed
+        const adaptiveAlpha = Math.min(0.55, Math.max(this.baseAlpha, this.baseAlpha + dist * 3.5));
         smoothed[i] = {
           x: prev.x + adaptiveAlpha * dx,
           y: prev.y + adaptiveAlpha * dy,
@@ -91,49 +109,64 @@ export class LandmarkSmoother {
 }
 
 /**
- * Exponential moving average with deadband threshold to stop angular flickering.
+ * 2-Stage Angle Stabilizer with Median Filtering and Velocity Gating.
+ * Prevents angular fluttering, flattens sensor noise, and maintains rock-solid readouts.
  */
 export class EmaSmoother {
   private value: number | null = null;
+  private readonly history: number[] = [];
+  private readonly historySize = 5;
 
   constructor(
-    private readonly alpha: number = 0.28,
-    private readonly deadband: number = 0.75, // in degrees
+    private readonly alpha: number = 0.22,
+    private readonly deadband: number = 1.2, // degrees
   ) {}
 
   reset() {
     this.value = null;
+    this.history.length = 0;
   }
 
   update(sample: number): number {
-    if (this.value === null) {
-      this.value = sample;
-      return sample;
+    // 1. Median filter window to reject frame glitches and single-sample outliers
+    this.history.push(sample);
+    if (this.history.length > this.historySize) {
+      this.history.shift();
     }
 
-    const diff = Math.abs(sample - this.value);
-    // Ignore micro-fluctuations when patient is holding steady
+    const sorted = [...this.history].sort((a, b) => a - b);
+    const medianSample = sorted[Math.floor(sorted.length / 2)];
+
+    if (this.value === null) {
+      this.value = medianSample;
+      return medianSample;
+    }
+
+    const diff = Math.abs(medianSample - this.value);
+
+    // 2. Deadband: ignore micro-tremors and breathing motions when holding
     if (diff < this.deadband) {
       return this.value;
     }
 
-    // Adaptive alpha: quick movements track fast, gentle holds stay rock-solid
-    const adaptiveAlpha = Math.min(0.65, Math.max(this.alpha, diff / 35));
-    this.value = adaptiveAlpha * sample + (1 - adaptiveAlpha) * this.value;
+    // 3. Velocity-scaled smoothing: smooth gradual holds, lag-free intentional reps
+    const adaptiveAlpha = Math.min(0.50, Math.max(this.alpha, diff / 40));
+    this.value = adaptiveAlpha * medianSample + (1 - adaptiveAlpha) * this.value;
     return this.value;
   }
 }
 
 /**
  * Locks to the tracked leg using landmark visibility to prevent side-flipping.
+ * Only requires the 3 leg landmarks (hip, knee, ankle) for a side.
  */
 export class SideTracker {
   private side: BodySide = "RIGHT";
   private switchVotes = 0;
 
   constructor(
-    private readonly visibilityMargin = 0.12,
-    private readonly framesToSwitch = 15,
+    private readonly visibilityMargin = 0.15,
+    private readonly framesToSwitch = 25, // ~1 second consistency to change side
   ) {}
 
   getSide(): BodySide {
@@ -146,14 +179,21 @@ export class SideTracker {
   }
 
   update(lm: PoseLandmark[], visibilityMin = DEFAULT_VISIBILITY_MIN): BodySide | null {
-    if (!lm || lm.length < 29) return null;
+    if (!lm || lm.length < 29) return this.side;
 
-    const rightVis =
-      (landmarkVisibility(lm[24]) + landmarkVisibility(lm[26]) + landmarkVisibility(lm[28])) / 3;
-    const leftVis =
-      (landmarkVisibility(lm[23]) + landmarkVisibility(lm[25]) + landmarkVisibility(lm[27])) / 3;
+    const hasRight = lm[24] && lm[26] && lm[28];
+    const hasLeft = lm[23] && lm[25] && lm[27];
 
-    if (rightVis < visibilityMin && leftVis < visibilityMin) return null;
+    if (!hasRight && !hasLeft) return this.side;
+
+    const rightVis = hasRight
+      ? (landmarkVisibility(lm[24]) + landmarkVisibility(lm[26]) + landmarkVisibility(lm[28])) / 3
+      : 0;
+    const leftVis = hasLeft
+      ? (landmarkVisibility(lm[23]) + landmarkVisibility(lm[25]) + landmarkVisibility(lm[27])) / 3
+      : 0;
+
+    if (rightVis < visibilityMin && leftVis < visibilityMin) return this.side;
 
     let preferred: BodySide;
     if (rightVis >= visibilityMin && leftVis >= visibilityMin) {
@@ -204,7 +244,16 @@ export function kneeAngleForSide(
 }
 
 /**
- * Exercise-aware angle calculation (Knee Flexion, Straight Leg Raise, Quad Sets, Heel Slides).
+ * Clinically normalized angle calculation for rehabilitation exercises:
+ *
+ * - Knee Flexion / Heel Slides:
+ *   Normalized flexion ROM (0° when leg is straight, counting UP to 90° as knee bends).
+ *
+ * - Straight Leg Raise:
+ *   Leg elevation off the floor/bed (0° when resting flat, counting UP to 45°).
+ *
+ * - Quad Sets / Terminal Knee Extension:
+ *   Knee extension deficit (0° when pressed completely flat).
  */
 export function calculateExerciseAngle(
   lm: PoseLandmark[],
@@ -230,31 +279,53 @@ export function calculateExerciseAngle(
   );
   if (kneeVis < visibilityMin) return null;
 
-  const kneeAngle = calculateAngle(hip, knee, ankle);
+  const rawKneeAngle = calculateAngle(hip, knee, ankle);
 
-  // For Straight Leg Raise: Patient lifts straight leg off ground.
-  // We compute the hip flexion angle (torso-hip-knee), or leg elevation.
-  if (exerciseKey.includes("straight-leg-raise") && shoulder) {
-    const hipAngle = calculateAngle(shoulder, hip, knee);
-    // When lying flat, torso-hip-knee is ~175-180 deg. As leg raises to 45 deg, angle decreases to ~135 deg.
-    // Normalized elevation angle = 180 - hipAngle (0 deg when flat, 45 deg when raised)
-    const elevation = Math.max(0, Math.min(90, Math.round(180 - hipAngle)));
-    return { angle: elevation, auxiliaryAngle: kneeAngle };
+  // 1. Straight Leg Raise: Elevation off the bed/floor
+  if (exerciseKey.includes("straight-leg-raise")) {
+    if (shoulder && landmarkVisibility(shoulder) >= visibilityMin) {
+      const hipAngle = calculateAngle(shoulder, hip, knee);
+      const elevation = Math.max(0, Math.min(90, Math.round(180 - hipAngle)));
+      return { angle: elevation, auxiliaryAngle: rawKneeAngle };
+    }
+    // Fallback if upper body/shoulder is outside camera frame:
+    // Compute elevation of hip-to-ankle vector relative to floor horizontal
+    const dy = hip.y - ankle.y;
+    const dx = Math.abs(ankle.x - hip.x) || 0.001;
+    const legAngleDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
+    const elevation = Math.max(0, Math.min(90, Math.round(Math.max(0, legAngleDeg))));
+    return { angle: elevation, auxiliaryAngle: rawKneeAngle };
   }
 
-  // Standard knee exercises (Flexion, Heel Slides, Quad Sets, Terminal Knee Extension)
-  return { angle: Math.round(kneeAngle) };
+  // 2. Quad Sets: Patient pushes knee flat into bed (Target: 0° flexion / 180° extension)
+  if (exerciseKey.includes("quad-sets")) {
+    const extensionDeficit = Math.max(0, Math.min(45, Math.round(180 - rawKneeAngle)));
+    return { angle: extensionDeficit, auxiliaryAngle: rawKneeAngle };
+  }
+
+  // 3. Terminal Knee Extension (TKE): Straightening from slight bend to flat (0°-10°)
+  if (exerciseKey.includes("terminal-knee-extension")) {
+    const extensionDeficit = Math.max(0, Math.min(60, Math.round(180 - rawKneeAngle)));
+    return { angle: extensionDeficit, auxiliaryAngle: rawKneeAngle };
+  }
+
+  // 4. Standard Knee Flexion & Heel Slides:
+  // Clinically normalized flexion degrees:
+  // 0° = straight extended leg at rest
+  // 90° = bent knee at 90 degrees
+  const flexionAngle = Math.max(0, Math.min(145, Math.round(180 - rawKneeAngle)));
+  return { angle: flexionAngle, auxiliaryAngle: rawKneeAngle };
 }
 
 export type RepEvent = "rep_completed" | "target_reached" | null;
 
 /**
- * Adaptive rep counter that configures thresholds dynamically based on the exercise target.
+ * Adaptive rep counter calibrated for physical therapy ROM curves.
+ * Requires intentional movement into target zone and clean return to starting position.
  */
 export class RepCounter {
   private state: "start" | "target_reached" = "start";
-  private targetHoldTime = 0;
-  private lastUpdate = Date.now();
+  private targetHoldStart = 0;
   private hasReportedTarget = false;
 
   constructor(
@@ -270,23 +341,18 @@ export class RepCounter {
 
   reset() {
     this.state = "start";
-    this.targetHoldTime = 0;
+    this.targetHoldStart = 0;
     this.hasReportedTarget = false;
-    this.lastUpdate = Date.now();
   }
 
   update(currentAngle: number): RepEvent {
-    const now = Date.now();
-    this.lastUpdate = now;
-
     const isStraightLegRaise = this.exerciseType.includes("straight-leg-raise");
-    const isFlexionType = !isStraightLegRaise && this.targetAngle <= 100;
+    const isExtensionType = this.exerciseType.includes("quad-sets") || this.exerciseType.includes("terminal-knee-extension");
 
     if (isStraightLegRaise) {
-      // Straight Leg Raise: Target e.g. 45° elevation.
-      // Starts near floor (angle < 15°).
-      const enterTarget = currentAngle >= this.targetAngle - 8;
-      const returnStart = currentAngle <= 16;
+      // Straight Leg Raise: Target 45° elevation
+      const enterTarget = currentAngle >= this.targetAngle - 7;
+      const returnStart = currentAngle <= 14;
 
       if (this.state === "start" && enterTarget) {
         this.state = "target_reached";
@@ -302,13 +368,10 @@ export class RepCounter {
       return null;
     }
 
-    if (isFlexionType) {
-      // Flexion / Heel Slides:
-      // Neutral / extended leg: knee angle > 135°.
-      // Target reach: knee angle <= targetAngle + 8 (e.g. 98° for a 90° target).
-      // Return: extends back out > 132°.
-      const enterTarget = currentAngle <= this.targetAngle + 8;
-      const returnExtended = currentAngle >= 135;
+    if (isExtensionType) {
+      // Quad Sets / TKE: Target 0° - 10° extension deficit
+      const enterTarget = currentAngle <= this.targetAngle + 6;
+      const returnStart = currentAngle >= this.targetAngle + 20;
 
       if (this.state === "start" && enterTarget) {
         this.state = "target_reached";
@@ -316,7 +379,7 @@ export class RepCounter {
           this.hasReportedTarget = true;
           return "target_reached";
         }
-      } else if (this.state === "target_reached" && returnExtended) {
+      } else if (this.state === "target_reached" && returnStart) {
         this.state = "start";
         this.hasReportedTarget = false;
         return "rep_completed";
@@ -324,15 +387,20 @@ export class RepCounter {
       return null;
     }
 
-    // Default general angle threshold (e.g. Terminal Knee Extension / Quad Sets near 170°-180°)
-    const targetDistance = Math.abs(currentAngle - this.targetAngle);
-    if (this.state === "start" && targetDistance <= 8) {
+    // Standard Flexion / Heel Slides:
+    // Starts near 0° - 25° (straight leg).
+    // Bends to target angle (e.g. 90° - 8 = 82°).
+    // Returns to straight leg (<= 28°).
+    const enterTarget = currentAngle >= this.targetAngle - 8;
+    const returnExtended = currentAngle <= 28;
+
+    if (this.state === "start" && enterTarget) {
       this.state = "target_reached";
       if (!this.hasReportedTarget) {
         this.hasReportedTarget = true;
         return "target_reached";
       }
-    } else if (this.state === "target_reached" && targetDistance >= 25) {
+    } else if (this.state === "target_reached" && returnExtended) {
       this.state = "start";
       this.hasReportedTarget = false;
       return "rep_completed";
@@ -350,7 +418,7 @@ export function roundAngle(angle: number): number {
 export function shouldEmitDisplayAngle(
   lastEmit: { time: number; value: number },
   rounded: number,
-  minIntervalMs = 50,
+  minIntervalMs = 40,
   minDelta = 1,
 ): boolean {
   const now = Date.now();
@@ -359,14 +427,17 @@ export function shouldEmitDisplayAngle(
   );
 }
 
-/** Red-zone hysteresis to avoid flickering alerts at the threshold. */
+/** Red-zone hysteresis: ONLY triggers when pushing dangerously beyond prescribed ROM */
 export function redZoneState(
   current: boolean,
-  deviation: number,
-  enterAbove = 34,
-  exitBelow = 26,
+  currentAngle: number,
+  targetAngle: number,
 ): boolean {
-  if (!current && deviation > enterAbove) return true;
-  if (current && deviation <= exitBelow) return false;
+  // Overextension threshold: pushing more than 16° past the target
+  const enterAbove = targetAngle + 16;
+  const exitBelow = targetAngle + 8;
+
+  if (!current && currentAngle > enterAbove) return true;
+  if (current && currentAngle <= exitBelow) return false;
   return current;
 }

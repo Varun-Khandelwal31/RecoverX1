@@ -3,6 +3,11 @@
 import { useMemo, useState, useEffect } from "react";
 import { Download, ShieldAlert, Trash2 } from "lucide-react";
 import { getUser } from "../../lib/auth";
+import {
+  speakPhysioGuidance,
+  getElevenLabsApiKey,
+  saveElevenLabsApiKey,
+} from "../../lib/voiceCoach";
 
 type Tab = "Account" | "Notifications" | "AI & Diagnostics" | "Privacy & Data";
 
@@ -30,6 +35,8 @@ export default function SettingsPage() {
   const [email, setEmail] = useState("arjun@example.com");
   const [geminiKey, setGeminiKey] = useState("");
   const [keySaved, setKeySaved] = useState(false);
+  const [elevenLabsKey, setElevenLabsKey] = useState("");
+  const [elevenLabsSaved, setElevenLabsSaved] = useState(false);
   const [speechTesting, setSpeechTesting] = useState(false);
 
   useEffect(() => {
@@ -42,6 +49,7 @@ export default function SettingsPage() {
       localStorage.getItem("gemini_api_key") ||
       "";
     setGeminiKey(savedKey);
+    setElevenLabsKey(getElevenLabsApiKey());
   }, []);
 
   const handleSaveGeminiKey = (e: React.FormEvent) => {
@@ -52,17 +60,19 @@ export default function SettingsPage() {
     setTimeout(() => setKeySaved(false), 3000);
   };
 
+  const handleSaveElevenLabsKey = (e: React.FormEvent) => {
+    e.preventDefault();
+    saveElevenLabsApiKey(elevenLabsKey);
+    setElevenLabsSaved(true);
+    setTimeout(() => setElevenLabsSaved(false), 3000);
+  };
+
   const handleTestSpeech = () => {
-    if (typeof window !== "undefined" && "speechSynthesis" in window) {
-      setSpeechTesting(true);
-      window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance("Welcome to RecoverX. Your form is looking great. Keep bending smoothly.");
-      u.rate = 1.0;
-      u.pitch = 1.0;
-      u.onend = () => setSpeechTesting(false);
-      u.onerror = () => setSpeechTesting(false);
-      window.speechSynthesis.speak(u);
-    }
+    setSpeechTesting(true);
+    speakPhysioGuidance("Welcome to your knee rehabilitation session. Let's do Knee Flexion with a target of 90 degrees. Move slowly and listen to your body.", {
+      priority: true,
+      onEnd: () => setSpeechTesting(false),
+    });
   };
 
   const [newPassword, setNewPassword] = useState("");
@@ -207,6 +217,52 @@ export default function SettingsPage() {
               {keySaved && (
                 <div className="p-3 rounded-lg bg-[var(--accent-light)] text-[var(--accent-dark)] text-xs font-semibold border border-[var(--accent)]/30 animate-fadeIn">
                   ✓ Custom Gemini API Key saved to local secure storage!
+                </div>
+              )}
+            </div>
+
+            <div className="card p-6 space-y-4">
+              <div className="flex items-center gap-2">
+                <span className="text-xl">🗣️</span>
+                <h2 className="font-display text-xl font-semibold text-[var(--text-1)]">
+                  ElevenLabs Voice AI (Specialist Audio)
+                </h2>
+              </div>
+              <p className="text-xs text-[var(--text-3)] leading-relaxed">
+                RecoverX includes high-fidelity clinical audio guidance using browser speech synthesis out-of-the-box. If you want hyper-realistic human AI voice cloning, provide your ElevenLabs API key below.
+              </p>
+
+              <form onSubmit={handleSaveElevenLabsKey} className="space-y-3 pt-2">
+                <label className="block text-xs font-semibold text-[var(--text-2)]">ElevenLabs API Key (Optional)</label>
+                <input
+                  type="password"
+                  value={elevenLabsKey}
+                  onChange={(e) => setElevenLabsKey(e.target.value)}
+                  placeholder="xi-api-key..."
+                  className="w-full rounded-[var(--r-sm)] border border-[var(--border)] bg-[var(--bg-input)] p-3 text-sm font-mono text-[var(--text-1)] outline-none focus:border-[var(--primary)] transition"
+                />
+                <div className="flex items-center gap-3 pt-1">
+                  <button type="submit" className="btn-primary px-5 py-2.5 text-xs font-semibold">
+                    Save Key
+                  </button>
+                  {elevenLabsKey && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setElevenLabsKey("");
+                        saveElevenLabsApiKey("");
+                      }}
+                      className="px-4 py-2.5 text-xs font-medium text-[var(--danger)] hover:bg-[var(--danger-light)] rounded-[var(--r-sm)] transition"
+                    >
+                      Remove Key
+                    </button>
+                  )}
+                </div>
+              </form>
+
+              {elevenLabsSaved && (
+                <div className="p-3 rounded-lg bg-[var(--accent-light)] text-[var(--accent-dark)] text-xs font-semibold border border-[var(--accent)]/30 animate-fadeIn">
+                  ✓ ElevenLabs Voice AI Key saved! Live sessions will now use ultra-realistic audio.
                 </div>
               )}
             </div>

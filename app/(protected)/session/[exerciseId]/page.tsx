@@ -22,6 +22,11 @@ import {
   roundAngle,
   shouldEmitDisplayAngle,
 } from "../../../lib/poseSmoothing";
+import {
+  speakPhysioGuidance,
+  getSpecialistCoachLine,
+  stopAllSpeech,
+} from "../../../lib/voiceCoach";
 
 type CameraState = "starting" | "ready" | "denied" | "error";
 type PoseState = "loading" | "ready" | "error";
@@ -68,8 +73,6 @@ const poseConnections = [
   [24, 26], [26, 28], [28, 30], [30, 32], [28, 32],
 ];
 
-const FEEDBACK_INTERVAL = 3500;
-
 function formatTime(ms: number) {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
   const minutes = Math.floor(totalSeconds / 60).toString().padStart(2, "0");
@@ -86,10 +89,15 @@ const POSE_MODEL_URLS = [
   "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
 ];
 
-function getAngleTone(deviation: number) {
-  if (deviation < 10) return { color: "#10B981", glow: "rgba(16,185,129,0.35)", label: "✓ In range" };
-  if (deviation < 25) return { color: "#F59E0B", glow: "rgba(245,158,11,0.35)", label: "↑ Getting close" };
-  return { color: "#EF4444", glow: "rgba(239,68,68,0.35)", label: "↑ Adjust form" };
+function getAngleTone(angle: number, targetAngle: number) {
+  const isBeyondTarget = angle > targetAngle + 15;
+  const isNearTarget = Math.abs(angle - targetAngle) <= 8;
+  const isAtRest = angle <= 22 && targetAngle >= 45;
+
+  if (isBeyondTarget) return { color: "#EF4444", glow: "rgba(239,68,68,0.35)", label: "⚠️ Beyond target" };
+  if (isNearTarget) return { color: "#10B981", glow: "rgba(16,185,129,0.35)", label: "✓ Target reached" };
+  if (isAtRest) return { color: "#94A3B8", glow: "rgba(148,163,184,0.2)", label: "Ready · Start position" };
+  return { color: "#0EA5E9", glow: "rgba(14,165,233,0.35)", label: "Bending smoothly" };
 }
 
 function painColor(value: number) {
@@ -147,10 +155,13 @@ export default function LiveSessionPage() {
   const angleLogRef = useRef<AngleLog[]>([]);
   const feedbackMessagesRef = useRef<FeedbackMessage[]>([]);
   const lastAngleLogTime = useRef(0);
-  const lastFeedbackTime = useRef(0);
   const isSpeakingRef = useRef(false);
-  const landmarkSmootherRef = useRef(new LandmarkSmoother(0.35, 0.002));
-  const angleSmootherRef = useRef(new EmaSmoother(0.28, 0.75));
+  const consecutiveMissedFrames = useRef(0);
+  const lastSpokenPhase = useRef<string>("");
+  const lastSpokenTime = useRef<number>(0);
+  const lastCameraPromptTime = useRef(0);
+  const landmarkSmootherRef = useRef(new LandmarkSmoother(0.25, 0.005));
+  const angleSmootherRef = useRef(new EmaSmoother(0.22, 1.2));
   const sideTrackerRef = useRef(new SideTracker());
   const repCounterRef = useRef(new RepCounter(config.targetAngle, exerciseId));
   const lastDisplayEmitRef = useRef({ time: 0, value: 0 });
@@ -191,7 +202,7 @@ export default function LiveSessionPage() {
   }, [config.targetAngle, exerciseId]);
 
   const angleDeviation = Math.abs(config.targetAngle - currentAngle);
-  const tone = getAngleTone(angleDeviation);
+  const tone = getAngleTone(currentAngle, config.targetAngle);
 
   // Feature 1: Form Score
   const formScore = repCount > 0 ? Math.round((correctReps / repCount) * 100) : 0;
@@ -235,139 +246,63 @@ export default function LiveSessionPage() {
     }
   }, [addFeedbackMessage, sessionPain]);
 
-  const speakInstantCoach = useCallback(
+  const speakSpecialistCoach = useCallback(
     (
-      type: "intro" | "target_reached" | "rep_completed" | "guidance" | "safety",
+      event:
+        | "intro"
+        | "rep_start"
+        | "approaching"
+        | "target_reached"
+        | "hold_guidance"
+        | "return_start"
+        | "rep_completed"
+        | "safe_limit"
+        | "camera_prompt",
       angle?: number,
       repNumber?: number,
     ) => {
-      if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
-      const synth = window.speechSynthesis;
+      const now = Date.now();
+      const isPriority = event === "target_reached" || event === "rep_completed" || event === "safe_limit";
 
-      // Check if already speaking - avoid cutting off words or stuttering
-      if ((synth.speaking || isSpeakingRef.current) && type !== "safety") {
+      // Throttle non-priority coaching so cues are calm, encouraging, and natural
+      if (!isPriority && now - lastSpokenTime.current < 6500) {
         return;
       }
 
-      // Only emergency safety alerts can interrupt
-      if (type === "safety") {
-        synth.cancel();
+      if (event === "camera_prompt") {
+        if (now - lastCameraPromptTime.current < 25000) return;
+        lastCameraPromptTime.current = now;
       }
 
-      let text = "";
-      let feedbackType: FeedbackType = "encouragement";
-
-      if (type === "intro") {
-        text = `Starting ${config.name}. Target angle is ${config.targetAngle} degrees. Begin when you're ready.`;
-        feedbackType = "encouragement";
-      } else if (type === "target_reached") {
-        const phrases = [
-          `Target reached! Hold steady.`,
-          `Right at ${config.targetAngle} degrees, hold it.`,
-          `Target achieved! Excellent control.`,
-          `Perfect angle. Hold for a moment.`,
-        ];
-        text = phrases[Math.floor(Math.random() * phrases.length)];
-        feedbackType = "encouragement";
-      } else if (type === "rep_completed") {
-        const rep = repNumber ?? (repCountRef.current + 1);
-        if (rep === Math.floor(config.targetReps / 2)) {
-          text = `Halfway there! ${rep} reps down, form looks fantastic.`;
-        } else if (rep >= config.targetReps) {
-          text = `Set complete! All ${config.targetReps} reps finished. Outstanding work!`;
-        } else {
-          const phrases = [
-            `Rep ${rep} complete, great form.`,
-            `Rep ${rep} done, smooth return.`,
-            `Nice repetition ${rep}, keep that rhythm.`,
-            `Rep ${rep} counted, looking strong.`,
-          ];
-          text = phrases[(rep - 1) % phrases.length];
-        }
-        feedbackType = "encouragement";
-      } else if (type === "guidance") {
-        if (angle === undefined) return;
-        const deviation = config.targetAngle - angle;
-        if (Math.abs(deviation) <= 8) {
-          text = "Nice control. Keep breathing.";
-          feedbackType = "encouragement";
-        } else if (deviation > 0) {
-          text = "Gently bend a little further.";
-          feedbackType = "correction";
-        } else {
-          text = "Ease back slightly toward the target.";
-          feedbackType = "correction";
-        }
-      } else if (type === "safety") {
-        text = "Warning: ease back slowly. Do not push into pain.";
-        feedbackType = "danger";
-      }
+      const text = getSpecialistCoachLine(config.name, config.targetAngle, event, {
+        currentAngle: angle ?? currentAngleRef.current,
+        repNumber: repNumber ?? (repCountRef.current + 1),
+        targetReps: config.targetReps,
+      });
 
       if (!text) return;
 
+      let feedbackType: FeedbackType = "encouragement";
+      if (event === "safe_limit") feedbackType = "danger";
+      else if (event === "camera_prompt" || event === "approaching") feedbackType = "correction";
+
       addFeedbackMessage(text, feedbackType);
+      lastSpokenTime.current = now;
+      lastSpokenPhase.current = event;
 
-      try {
-        const utterance = new SpeechSynthesisUtterance(text);
-        const voices = synth.getVoices();
-        if (voices && voices.length > 0) {
-          const preferred = [
-            "Samantha", "Ava", "Victoria", "Daniel", "Karen", "Alex",
-            "Google US English", "Google UK English Female",
-            "Microsoft Jenny", "Microsoft Aria", "Natural"
-          ];
-          let chosen = null;
-          for (const name of preferred) {
-            chosen = voices.find((v) => v.name.includes(name));
-            if (chosen) break;
-          }
-          if (!chosen) {
-            chosen = voices.find(
-              (v) =>
-                v.lang.startsWith("en") &&
-                !v.name.toLowerCase().includes("whisper") &&
-                !v.name.toLowerCase().includes("bells")
-            );
-          }
-          if (chosen) utterance.voice = chosen;
-        }
-
-        utterance.rate = 1.0;
-        utterance.pitch = 1.0;
-        utterance.volume = 1.0;
-
-        utterance.onstart = () => {
+      speakPhysioGuidance(text, {
+        priority: isPriority,
+        onStart: () => {
           isSpeakingRef.current = true;
           setIsSpeaking(true);
-        };
-        utterance.onend = () => {
+        },
+        onEnd: () => {
           isSpeakingRef.current = false;
           setIsSpeaking(false);
-        };
-        utterance.onerror = () => {
-          isSpeakingRef.current = false;
-          setIsSpeaking(false);
-        };
-
-        synth.speak(utterance);
-      } catch (err) {
-        console.warn("Speech synthesis error:", err);
-        isSpeakingRef.current = false;
-        setIsSpeaking(false);
-      }
+        },
+      });
     },
     [config.name, config.targetAngle, config.targetReps, addFeedbackMessage],
-  );
-
-  const triggerFeedback = useCallback(
-    (angle: number) => {
-      const now = Date.now();
-      if (now - lastFeedbackTime.current < FEEDBACK_INTERVAL) return;
-      lastFeedbackTime.current = now;
-
-      speakInstantCoach("guidance", angle);
-    },
-    [speakInstantCoach],
   );
 
   const drawFrame = useCallback(
@@ -451,7 +386,7 @@ export default function LiveSessionPage() {
         const hy = hip.y * h;
         const angle1 = Math.atan2((shoulder.y - hip.y) * h, ((1 - shoulder.x) - (1 - hip.x)) * w);
         const angle2 = Math.atan2((knee.y - hip.y) * h, ((1 - knee.x) - (1 - hip.x)) * w);
-        const arcTone = getAngleTone(Math.abs(config.targetAngle - currentAngleRef.current));
+        const arcTone = getAngleTone(currentAngleRef.current, config.targetAngle);
 
         ctx.beginPath();
         ctx.arc(hx, hy, 55, angle1, angle2);
@@ -470,7 +405,7 @@ export default function LiveSessionPage() {
         const ky = knee.y * h;
         const angle1 = Math.atan2((hip.y - knee.y) * h, ((1 - hip.x) - (1 - knee.x)) * w);
         const angle2 = Math.atan2((ankle.y - knee.y) * h, ((1 - ankle.x) - (1 - knee.x)) * w);
-        const arcTone = getAngleTone(Math.abs(config.targetAngle - currentAngleRef.current));
+        const arcTone = getAngleTone(currentAngleRef.current, config.targetAngle);
 
         ctx.beginPath();
         ctx.arc(kx, ky, 55, angle1, angle2);
@@ -491,16 +426,20 @@ export default function LiveSessionPage() {
 
   const processAngles = useCallback(
     (smoothedLm: PoseLandmark[]) => {
-      if (!smoothedLm?.length) return;
-      if (!smoothedLm[23] || !smoothedLm[24] || !smoothedLm[25] || !smoothedLm[26] || !smoothedLm[27] || !smoothedLm[28]) return;
+      if (!smoothedLm?.length || smoothedLm.length < 29) return;
 
       const side = sideTrackerRef.current.update(smoothedLm);
       if (!side) return;
+
+      // Only require the landmarks for the active side being tracked
+      const [hipIdx, kneeIdx, ankleIdx] = side === "RIGHT" ? [24, 26, 28] : [23, 25, 27];
+      if (!smoothedLm[hipIdx] || !smoothedLm[kneeIdx] || !smoothedLm[ankleIdx]) return;
 
       const measurement = calculateExerciseAngle(smoothedLm, side, exerciseId);
       if (!measurement) return;
 
       currentSideRef.current = side;
+      const prevAngle = currentAngleRef.current;
       const smoothed = angleSmootherRef.current.update(measurement.angle);
       const angle = roundAngle(smoothed);
 
@@ -521,9 +460,16 @@ export default function LiveSessionPage() {
         angleLogRef.current.push({ t: now - sessionStartRef.current, a: angle });
       }
 
+      // Movement phase guidance from specialist PT
+      if (prevAngle <= 20 && angle >= 32) {
+        speakSpecialistCoach("rep_start", angle);
+      } else if (angle >= config.targetAngle - 18 && angle < config.targetAngle - 8) {
+        speakSpecialistCoach("approaching", angle);
+      }
+
       const repEvent = repCounterRef.current.update(smoothed);
       if (repEvent === "target_reached") {
-        speakInstantCoach("target_reached", angle);
+        speakSpecialistCoach("target_reached", angle);
       } else if (repEvent === "rep_completed") {
         const nextRep = repCountRef.current + 1;
         repCountRef.current = nextRep;
@@ -532,37 +478,33 @@ export default function LiveSessionPage() {
         const isGood = deviation <= 14;
         if (isGood) setCorrectReps((val) => val + 1);
         setRepHistory((prev) => [...prev, { rep: nextRep, angle: bestAngleRef.current || angle, correct: isGood }]);
-        speakInstantCoach("rep_completed", angle, nextRep);
+        speakSpecialistCoach("rep_completed", angle, nextRep);
         bestAngleRef.current = 0;
       }
 
-      triggerFeedback(angle);
-
-      // Feature 5: Red Zone Alert (hysteresis on smoothed angle)
-      const dev = Math.abs(config.targetAngle - angle);
-      const nextRedZone = redZoneState(redZoneRef.current, dev);
+      // Feature 5: Red Zone Alert (ONLY fires if pushing dangerously beyond target ROM)
+      const nextRedZone = redZoneState(redZoneRef.current, angle, config.targetAngle);
       if (nextRedZone !== redZoneRef.current) {
         redZoneRef.current = nextRedZone;
         setRedZoneActive(nextRedZone);
         if (nextRedZone) {
-          speakInstantCoach("safety");
+          speakSpecialistCoach("safe_limit", angle);
         }
       }
 
-      // Feature 3: Compensation Detector (check every 4s)
+      // Feature 3: Compensation Detector (check every 5s)
       const now2 = Date.now();
-      if (now2 - lastCompCheck.current > 4000 && smoothedLm[11] && smoothedLm[12] && smoothedLm[23] && smoothedLm[24]) {
+      if (now2 - lastCompCheck.current > 5000 && smoothedLm[11] && smoothedLm[12] && smoothedLm[23] && smoothedLm[24]) {
         lastCompCheck.current = now2;
         const issues: string[] = [];
         const shoulderTilt = Math.abs(smoothedLm[11].y - smoothedLm[12].y);
         const hipTilt = Math.abs(smoothedLm[23].y - smoothedLm[24].y);
-        if (shoulderTilt > 0.06) issues.push("Shoulder tilt detected — keep shoulders level");
-        if (hipTilt > 0.05) issues.push("Hip shift detected — keep hips square");
-        if (dev > 20 && angle < config.targetAngle * 0.5) issues.push("Insufficient range — try to bend further");
+        if (shoulderTilt > 0.08) issues.push("Shoulder tilt detected — keep shoulders level");
+        if (hipTilt > 0.07) issues.push("Hip shift detected — keep hips square");
         setCompensations(issues);
       }
     },
-    [exerciseId, config.targetAngle, triggerFeedback, speakInstantCoach],
+    [exerciseId, config.targetAngle, speakSpecialistCoach],
   );
 
   const detectLoop = useCallback(
@@ -576,16 +518,35 @@ export default function LiveSessionPage() {
         lastDetectTime.current = timestamp;
         const results = landmarkerRef.current.detectForVideo(videoRef.current, timestamp) as PoseResult;
         if (results.landmarks && results.landmarks.length > 0) {
+          consecutiveMissedFrames.current = 0;
+          if (!poseDetectedRef.current) {
+            poseDetectedRef.current = true;
+            setPoseDetected(true);
+          }
           const smoothedLm = landmarkSmootherRef.current.update(results.landmarks[0]);
           drawFrame(smoothedLm);
           processAngles(smoothedLm);
         } else {
-          drawFrame(null);
+          consecutiveMissedFrames.current += 1;
+          // Hold last known smoothed landmarks during brief momentary drops to avoid flickering
+          if (consecutiveMissedFrames.current <= 5) {
+            drawFrame(landmarkSmootherRef.current.update([]));
+          } else {
+            drawFrame(null);
+          }
+
+          if (consecutiveMissedFrames.current > 25) {
+            if (poseDetectedRef.current) {
+              poseDetectedRef.current = false;
+              setPoseDetected(false);
+              speakSpecialistCoach("camera_prompt");
+            }
+          }
         }
       }
       animFrameRef.current = requestAnimationFrame(detectLoop);
     },
-    [drawFrame, processAngles],
+    [drawFrame, processAngles, speakSpecialistCoach],
   );
 
   const initMediaPipe = useCallback(async () => {
@@ -599,9 +560,9 @@ export default function LiveSessionPage() {
       const poseOptions = {
         runningMode: "VIDEO" as const,
         numPoses: 1,
-        minPoseDetectionConfidence: 0.65,
-        minPosePresenceConfidence: 0.65,
-        minTrackingConfidence: 0.65,
+        minPoseDetectionConfidence: 0.45,
+        minPosePresenceConfidence: 0.45,
+        minTrackingConfidence: 0.45,
       };
 
       let landmarker: PoseLandmarker | null = null;
@@ -674,7 +635,7 @@ export default function LiveSessionPage() {
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
       streamRef.current?.getTracks().forEach((track) => track.stop());
       landmarkerRef.current?.close?.();
-      window.speechSynthesis?.cancel();
+      stopAllSpeech();
     };
   }, [sessionCleared, showRedFlagWarning, startCamera]);
 
@@ -692,7 +653,7 @@ export default function LiveSessionPage() {
     const interval = setInterval(() => {
       simTime += 0.08;
       const cycle = (Math.sin(simTime) + 1) / 2;
-      const simAngle = Math.round(18 + cycle * (config.targetAngle - 10));
+      const simAngle = Math.round(5 + cycle * (config.targetAngle - 5));
 
       setCurrentAngle(simAngle);
       currentAngleRef.current = simAngle;
@@ -706,7 +667,7 @@ export default function LiveSessionPage() {
       // Check target reached
       if (Math.abs(simAngle - config.targetAngle) <= 6 && !simTargetReported.current) {
         simTargetReported.current = true;
-        speakInstantCoach("target_reached", simAngle);
+        speakSpecialistCoach("target_reached", simAngle);
       } else if (Math.abs(simAngle - config.targetAngle) > 20) {
         simTargetReported.current = false;
       }
@@ -720,7 +681,7 @@ export default function LiveSessionPage() {
         setRepCount(localReps);
         setCorrectReps(localCorrect);
         setRepHistory((prev) => [...prev, { rep: localReps, angle: simAngle, correct: isGood }]);
-        speakInstantCoach("rep_completed", simAngle, localReps);
+        speakSpecialistCoach("rep_completed", simAngle, localReps);
       }
 
       // Draw virtual stick figure skeleton on canvas
@@ -808,7 +769,7 @@ export default function LiveSessionPage() {
     }, 70);
 
     return () => clearInterval(interval);
-  }, [isSimulating, config.targetAngle, repCount, correctReps, speakInstantCoach]);
+  }, [isSimulating, config.targetAngle, repCount, correctReps, speakSpecialistCoach]);
 
   const endSession = async () => {
     setPainAfter(sessionPain);
@@ -992,10 +953,10 @@ Write 2 concise, warm, professional sentences assessing their mobility, safety, 
                 )}
 
                 {!poseDetected && cameraState === "ready" && poseState === "ready" && (
-                  <div className="no-pose-overlay absolute inset-0 flex flex-col items-center justify-center bg-[rgba(255,255,255,0.68)] text-center backdrop-blur-sm">
-                    <div className="text-5xl">🕴️</div>
-                    <p className="mt-3 font-display text-xl text-[var(--text-1)]">Step back — we need to see your full body</p>
-                    <p className="mt-1 text-[13px] text-[var(--text-3)]">Make sure you&apos;re 6–8 feet from the camera</p>
+                  <div className="no-pose-overlay absolute inset-0 flex flex-col items-center justify-center bg-[rgba(13,27,42,0.85)] text-center backdrop-blur-md transition-opacity duration-300">
+                    <div className="text-5xl">🧘‍♂️</div>
+                    <p className="mt-3 font-display text-xl text-white">Adjust your position</p>
+                    <p className="mt-1 text-sm text-slate-300">Make sure your leg and knee are clearly in view of the camera (3–5 feet away)</p>
                   </div>
                 )}
 
@@ -1216,7 +1177,7 @@ Write 2 concise, warm, professional sentences assessing their mobility, safety, 
                 setShowRedFlagWarning(false);
                 setSessionCleared(true);
                 setTimeout(() => {
-                  speakInstantCoach("intro");
+                  speakSpecialistCoach("intro");
                 }, 600);
               }}
               className="btn-primary mt-6 w-full px-6 py-3 text-sm"
